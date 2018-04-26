@@ -24,10 +24,15 @@
 #include <pass.h>
 #include <wasm-s-parser.h>
 #include <support/threads.h>
-#include <ast_utils.h>
-#include <ast/cost.h>
-#include <ast/properties.h>
-#include <ast/manipulation.h>
+#include <ir/utils.h>
+#include <ir/cost.h>
+#include <ir/effects.h>
+#include <ir/manipulation.h>
+#include <ir/properties.h>
+#include <ir/literal-utils.h>
+#include <ir/load-utils.h>
+
+// TODO: Use the new sign-extension opcodes where appropriate. This needs to be conditionalized on the availability of atomics.
 
 namespace wasm {
 
@@ -111,7 +116,7 @@ struct Match {
       if (!call || call->operands.size() != 1 || call->operands[0]->type != i32 || !call->operands[0]->is<Const>()) return false;
       Index index = call->operands[0]->cast<Const>()->value.geti32();
       // handle our special functions
-      auto checkMatch = [&](WasmType type) {
+      auto checkMatch = [&](Type type) {
         if (type != none && subSeen->type != type) return false;
         while (index >= wildcards.size()) {
           wildcards.push_back(nullptr);
@@ -187,14 +192,14 @@ Index getMaxBits(Expression* curr, LocalInfoProvider* localInfoProvider) {
       case OrInt32: case XorInt32: return std::max(getMaxBits(binary->left, localInfoProvider), getMaxBits(binary->right, localInfoProvider));
       case ShlInt32: {
         if (auto* shifts = binary->right->dynCast<Const>()) {
-          return std::min(Index(32), getMaxBits(binary->left, localInfoProvider) + shifts->value.geti32());
+          return std::min(Index(32), getMaxBits(binary->left, localInfoProvider) + Bits::getEffectiveShifts(shifts));
         }
         return 32;
       }
       case ShrUInt32: {
         if (auto* shift = binary->right->dynCast<Const>()) {
           auto maxBits = getMaxBits(binary->left, localInfoProvider);
-          auto shifts = std::min(Index(shift->value.geti32()), maxBits); // can ignore more shifts than zero us out
+          auto shifts = std::min(Index(Bits::getEffectiveShifts(shift)), maxBits); // can ignore more shifts than zero us out
           return std::max(Index(0), maxBits - shifts);
         }
         return 32;
@@ -203,7 +208,7 @@ Index getMaxBits(Expression* curr, LocalInfoProvider* localInfoProvider) {
         if (auto* shift = binary->right->dynCast<Const>()) {
           auto maxBits = getMaxBits(binary->left, localInfoProvider);
           if (maxBits == 32) return 32;
-          auto shifts = std::min(Index(shift->value.geti32()), maxBits); // can ignore more shifts than zero us out
+          auto shifts = std::min(Index(Bits::getEffectiveShifts(shift)), maxBits); // can ignore more shifts than zero us out
           return std::max(Index(0), maxBits - shifts);
         }
         return 32;
@@ -226,8 +231,8 @@ Index getMaxBits(Expression* curr, LocalInfoProvider* localInfoProvider) {
     }
   } else if (auto* unary = curr->dynCast<Unary>()) {
     switch (unary->op) {
-      case ClzInt32: case CtzInt32: case PopcntInt32: return 5;
-      case ClzInt64: case CtzInt64: case PopcntInt64: return 6;
+      case ClzInt32: case CtzInt32: case PopcntInt32: return 6;
+      case ClzInt64: case CtzInt64: case PopcntInt64: return 7;
       case EqZInt32: case EqZInt64: return 1;
       case WrapInt64: return std::min(Index(32), getMaxBits(unary->value, localInfoProvider));
       default: {}
@@ -239,7 +244,8 @@ Index getMaxBits(Expression* curr, LocalInfoProvider* localInfoProvider) {
     return localInfoProvider->getMaxBitsForLocal(get);
   } else if (auto* load = curr->dynCast<Load>()) {
     // if signed, then the sign-extension might fill all the bits
-    if (!load->signed_) {
+    // if unsigned, then we have a limit
+    if (LoadUtils::isSignRelevant(load) && !load->signed_) {
       return 8 * load->bytes;
     }
   }
@@ -316,7 +322,7 @@ struct LocalScanner : PostWalker<LocalScanner> {
     if (Properties::getSignExtValue(value)) {
       signExtBits = Properties::getSignExtBits(value);
     } else if (auto* load = value->dynCast<Load>()) {
-      if (load->signed_) {
+      if (LoadUtils::isSignRelevant(load) && load->signed_) {
         signExtBits = load->bytes * 8;
       }
     }
@@ -332,7 +338,7 @@ struct LocalScanner : PostWalker<LocalScanner> {
     return getBitsForType(get->type);
   }
 
-  Index getBitsForType(WasmType type) {
+  Index getBitsForType(Type type) {
     switch (type) {
       case i32: return 32;
       case i64: return 64;
@@ -360,7 +366,7 @@ struct OptimizeInstructions : public WalkerPass<PostWalker<OptimizeInstructions,
       scanner.walkFunction(func);
     }
     // main walk
-    WalkerPass<PostWalker<OptimizeInstructions, UnifiedExpressionVisitor<OptimizeInstructions>>>::doWalkFunction(func);
+    super::doWalkFunction(func);
   }
 
   void visitExpression(Expression* curr) {
@@ -395,6 +401,14 @@ struct OptimizeInstructions : public WalkerPass<PostWalker<OptimizeInstructions,
 
   // Optimizations that don't yet fit in the pattern DSL, but could be eventually maybe
   Expression* handOptimize(Expression* curr) {
+    // if this contains dead code, don't bother trying to optimize it, the type
+    // might change (if might not be unreachable if just one arm is, for example).
+    // this optimization pass focuses on actually executing code. the only
+    // exceptions are control flow changes
+    if (curr->type == unreachable &&
+        !curr->is<Break>() && !curr->is<Switch>() && !curr->is<If>()) {
+      return nullptr;
+    }
     if (auto* binary = curr->dynCast<Binary>()) {
       if (Properties::isSymmetric(binary)) {
         // canonicalize a const to the second position
@@ -408,7 +422,8 @@ struct OptimizeInstructions : public WalkerPass<PostWalker<OptimizeInstructions,
         if (extraShifts == 0) {
           if (auto* load = getFallthrough(ext)->dynCast<Load>()) {
             // pattern match a load of 8 bits and a sign extend using a shl of 24 then shr_s of 24 as well, etc.
-            if ((load->bytes == 1 && bits == 8) || (load->bytes == 2 && bits == 16)) {
+            if (LoadUtils::canBeSigned(load) &&
+                ((load->bytes == 1 && bits == 8) || (load->bytes == 2 && bits == 16))) {
               // if the value falls through, we can't alter the load, as it might be captured in a tee
               if (load->signed_ == true || load == ext) {
                 load->signed_ = true;
@@ -452,7 +467,7 @@ struct OptimizeInstructions : public WalkerPass<PostWalker<OptimizeInstructions,
             if ((count > 0 && count < 32 - bits) || (constSignBit && count == 0)) {
               // mixed or [zero upper const bits with sign bit set]; the compared values can never be identical, so
               // force something definitely impossible even after zext
-              assert(bits < 31);
+              assert(bits < 32);
               c->value = Literal(int32_t(0x80000000));
               // TODO: if no side effects, we can just replace it all with 1 or 0
             } else {
@@ -491,7 +506,43 @@ struct OptimizeInstructions : public WalkerPass<PostWalker<OptimizeInstructions,
           }
         }
         // note that both left and right may be consts, but then we let precompute compute the constant result
-      } else if (binary->op == AddInt32 || binary->op == SubInt32) {
+      } else if (binary->op == AddInt32) {
+        // try to get rid of (0 - ..), that is, a zero only used to negate an
+        // int. an add of a subtract can be flipped in order to remove it:
+        //   (i32.add
+        //     (i32.sub
+        //       (i32.const 0)
+        //       X
+        //     )
+        //     Y
+        //   )
+        // =>
+        //   (i32.sub
+        //     Y
+        //     X
+        //   )
+        if (auto* sub = binary->left->dynCast<Binary>()) {
+          if (sub->op == SubInt32) {
+            if (auto* subZero = sub->left->dynCast<Const>()) {
+              if (subZero->value.geti32() == 0) {
+                sub->left = binary->right;
+                return sub;
+              }
+            }
+          }
+        }
+        if (auto* sub = binary->right->dynCast<Binary>()) {
+          if (sub->op == SubInt32) {
+            if (auto* subZero = sub->left->dynCast<Const>()) {
+              if (subZero->value.geti32() == 0) {
+                sub->left = binary->left;
+                return sub;
+              }
+            }
+          }
+        }
+        return optimizeAddedConstants(binary);
+      } else if (binary->op == SubInt32) {
         return optimizeAddedConstants(binary);
       }
       // a bunch of operations on a constant right side can be simplified
@@ -502,7 +553,7 @@ struct OptimizeInstructions : public WalkerPass<PostWalker<OptimizeInstructions,
           if (mask == -1) {
             return binary->left;
           }
-          // small loads do not need to be masted, the load itself masks
+          // small loads do not need to be masked, the load itself masks
           if (auto* load = binary->left->dynCast<Load>()) {
             if ((load->bytes == 1 && mask == 0xff) ||
                 (load->bytes == 2 && mask == 0xffff)) {
@@ -516,6 +567,19 @@ struct OptimizeInstructions : public WalkerPass<PostWalker<OptimizeInstructions,
             }
           }
         }
+        // some math operations have trivial results TODO: many more
+        if (right->value == Literal(int32_t(0))) {
+          if (binary->op == ShlInt32 || binary->op == ShrUInt32 || binary->op == ShrSInt32 || binary->op == OrInt32) {
+            return binary->left;
+          } else if ((binary->op == MulInt32 || binary->op == AndInt32) &&
+                     !EffectAnalyzer(getPassOptions(), binary->left).hasSideEffects()) {
+            return binary->right;
+          }
+        } else if (right->value == Literal(int32_t(1))) {
+          if (binary->op == MulInt32) {
+            return binary->left;
+          }
+        }
         // the square of some operations can be merged
         if (auto* left = binary->left->dynCast<Binary>()) {
           if (left->op == binary->op) {
@@ -526,14 +590,58 @@ struct OptimizeInstructions : public WalkerPass<PostWalker<OptimizeInstructions,
               } else if (left->op == OrInt32) {
                 leftRight->value = leftRight->value.or_(right->value);
                 return left;
-              } else if (left->op == ShlInt32 || left->op == ShrUInt32 || left->op == ShrSInt32) {
-                leftRight->value = leftRight->value.add(right->value);
+              } else if (left->op == ShlInt32 || left->op == ShrUInt32 || left->op == ShrSInt32 ||
+                         left->op == ShlInt64 || left->op == ShrUInt64 || left->op == ShrSInt64) {
+                // shifts only use an effective amount from the constant, so adding must
+                // be done carefully
+                auto total = Bits::getEffectiveShifts(leftRight) + Bits::getEffectiveShifts(right);
+                if (total == Bits::getEffectiveShifts(total, right->type)) {
+                  // no overflow, we can do this
+                  leftRight->value = LiteralUtils::makeLiteralFromInt32(total, right->type);
+                  return left;
+                } // TODO: handle overflows
+              }
+            }
+          }
+        }
+        // math operations on a constant power of 2 right side can be optimized
+        if (right->type == i32) {
+          uint32_t c = right->value.geti32();
+          if (IsPowerOf2(c)) {
+            if (binary->op == MulInt32) {
+              return optimizePowerOf2Mul(binary, c);
+            } else if (binary->op == RemUInt32) {
+              return optimizePowerOf2URem(binary, c);
+            }
+          }
+        }
+      }
+      // bitwise operations
+      if (binary->op == AndInt32) {
+        // try de-morgan's AND law,
+        //  (eqz X) and (eqz Y) === eqz (X or Y)
+        // Note that the OR and XOR laws do not work here, as these
+        // are not booleans (we could check if they are, but a boolean
+        // would already optimize with the eqz anyhow, unless propagating).
+        // But for AND, the left is true iff X and Y are each all zero bits,
+        // and the right is true if the union of their bits is zero; same.
+        if (auto* left = binary->left->dynCast<Unary>()) {
+          if (left->op == EqZInt32) {
+            if (auto* right = binary->right->dynCast<Unary>()) {
+              if (right->op == EqZInt32) {
+                // reuse one unary, drop the other
+                auto* leftValue = left->value;
+                left->value = binary;
+                binary->left = leftValue;
+                binary->right = right->value;
+                binary->op = OrInt32;
                 return left;
               }
             }
           }
         }
       }
+      // for and and or, we can potentially conditionalize
       if (binary->op == AndInt32 || binary->op == OrInt32) {
         return conditionalizeExpensiveOnBitwise(binary);
       }
@@ -597,16 +705,33 @@ struct OptimizeInstructions : public WalkerPass<PostWalker<OptimizeInstructions,
             std::swap(iff->ifTrue, iff->ifFalse);
           }
         }
-        if (ExpressionAnalyzer::equal(iff->ifTrue, iff->ifFalse)) {
+        if (iff->condition->type != unreachable && ExpressionAnalyzer::equal(iff->ifTrue, iff->ifFalse)) {
           // sides are identical, fold
-          if (!EffectAnalyzer(getPassOptions(), iff->condition).hasSideEffects()) {
+          // if we can replace the if with one arm, and no side effects in the condition, do that
+          auto needCondition = EffectAnalyzer(getPassOptions(), iff->condition).hasSideEffects();
+          auto typeIsIdentical = iff->ifTrue->type == iff->type;
+          if (typeIsIdentical && !needCondition) {
             return iff->ifTrue;
           } else {
             Builder builder(*getModule());
-            return builder.makeSequence(
-              builder.makeDrop(iff->condition),
-              iff->ifTrue
-            );
+            if (typeIsIdentical) {
+              return builder.makeSequence(
+                builder.makeDrop(iff->condition),
+                iff->ifTrue
+              );
+            } else {
+              // the types diff. as the condition is reachable, that means the if must be
+              // concrete while the arm is not
+              assert(isConcreteType(iff->type) && iff->ifTrue->type == unreachable);
+              // emit a block with a forced type
+              auto* ret = builder.makeBlock();
+              if (needCondition) {
+                ret->list.push_back(builder.makeDrop(iff->condition));
+              }
+              ret->list.push_back(iff->ifTrue);
+              ret->finalize(iff->type);
+              return ret;
+            }
           }
         }
       }
@@ -764,7 +889,7 @@ private:
           return;
         } else if (binary->op == ShlInt32) {
           if (auto* c = binary->right->dynCast<Const>()) {
-            seek(binary->left, mul * Pow2(c->value.geti32()));
+            seek(binary->left, mul * Pow2(Bits::getEffectiveShifts(c)));
             return;
           }
         } else if (binary->op == MulInt32) {
@@ -820,9 +945,10 @@ private:
             return;
           }
         } else if (curr->op == ShlInt32) {
-          // shifting a 0 is a 0, unless the shift has side effects
-          if (left && left->value.geti32() == 0 && !EffectAnalyzer(passOptions, curr->right).hasSideEffects()) {
-            replaceCurrent(left);
+          // shifting a 0 is a 0, or anything by 0 has no effect, all unless the shift has side effects
+          if (((left && left->value.geti32() == 0) || (right && Bits::getEffectiveShifts(right) == 0)) &&
+              !EffectAnalyzer(passOptions, curr->right).hasSideEffects()) {
+            replaceCurrent(curr->left);
             return;
           }
         } else if (curr->op == MulInt32) {
@@ -867,14 +993,17 @@ private:
     auto* left = binary->left;
     auto* right = binary->right;
     if (!Properties::emitsBoolean(left) || !Properties::emitsBoolean(right)) return nullptr;
-    auto leftEffects = EffectAnalyzer(getPassOptions(), left).hasSideEffects();
-    auto rightEffects = EffectAnalyzer(getPassOptions(), right).hasSideEffects();
-    if (leftEffects && rightEffects) return nullptr; // both must execute
-   // canonicalize with side effects, if any, happening on the left
-    if (rightEffects) {
+    auto leftEffects = EffectAnalyzer(getPassOptions(), left);
+    auto rightEffects = EffectAnalyzer(getPassOptions(), right);
+    auto leftHasSideEffects = leftEffects.hasSideEffects();
+    auto rightHasSideEffects = rightEffects.hasSideEffects();
+    if (leftHasSideEffects && rightHasSideEffects) return nullptr; // both must execute
+    // canonicalize with side effects, if any, happening on the left
+    if (rightHasSideEffects) {
       if (CostAnalyzer(left).cost < MIN_COST) return nullptr; // avoidable code is too cheap
+      if (leftEffects.invalidates(rightEffects)) return nullptr; // cannot reorder
       std::swap(left, right);
-    } else if (leftEffects) {
+    } else if (leftHasSideEffects) {
       if (CostAnalyzer(right).cost < MIN_COST) return nullptr; // avoidable code is too cheap
     } else {
       // no side effects, reorder based on cost estimation
@@ -901,9 +1030,41 @@ private:
     // it's better to do the opposite for gzip purposes as well as for readability.
     auto* last = ptr->dynCast<Const>();
     if (last) {
-      last->value = Literal(int32_t(last->value.geti32() + offset));
-      offset = 0;
+      // don't do this if it would wrap the pointer
+      uint64_t value64 = last->value.geti32();
+      uint64_t offset64 = offset;
+      if (value64 <= std::numeric_limits<int32_t>::max() &&
+          offset64 <= std::numeric_limits<int32_t>::max() &&
+          value64 + offset64 <= std::numeric_limits<int32_t>::max()) {
+        last->value = Literal(int32_t(value64 + offset64));
+        offset = 0;
+      }
     }
+  }
+
+  // Optimize a multiply by a power of two on the right, which
+  // can be a shift.
+  // This doesn't shrink code size, and VMs likely optimize it anyhow,
+  // but it's still worth doing since
+  //  * Often shifts are more common than muls.
+  //  * The constant is smaller.
+  Expression* optimizePowerOf2Mul(Binary* binary, uint32_t c) {
+    uint32_t shifts = CountTrailingZeroes(c);
+    binary->op = ShlInt32;
+    binary->right->cast<Const>()->value = Literal(int32_t(shifts));
+    return binary;
+  }
+
+  // Optimize an unsigned divide by a power of two on the right,
+  // which can be an AND mask
+  // This doesn't shrink code size, and VMs likely optimize it anyhow,
+  // but it's still worth doing since
+  //  * Usually ands are more common than urems.
+  //  * The constant is slightly smaller.
+  Expression* optimizePowerOf2URem(Binary* binary, uint32_t c) {
+    binary->op = AndInt32;
+    binary->right->cast<Const>()->value = Literal(int32_t(c - 1));
+    return binary;
   }
 
   Expression* makeZeroExt(Expression* curr, int32_t bits) {
@@ -912,7 +1073,7 @@ private:
   }
 
   // given an "almost" sign extend - either a proper one, or it
-  // has too many shifts left - we remove the sig extend. If there are
+  // has too many shifts left - we remove the sign extend. If there are
   // too many shifts, we split the shifts first, so this removes the
   // two sign extend shifts and adds one (smaller one)
   Expression* removeAlmostSignExt(Binary* outer) {

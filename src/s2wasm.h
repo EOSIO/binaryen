@@ -391,7 +391,7 @@ class S2WasmBuilder {
     return str;
   }
 
-  WasmType tryGetType() {
+  Type tryGetType() {
     if (match("i32")) return i32;
     if (match("i64")) return i64;
     if (match("f32")) return f32;
@@ -399,9 +399,9 @@ class S2WasmBuilder {
     return none;
   }
 
-  WasmType tryGetTypeWithoutNewline() {
+  Type tryGetTypeWithoutNewline() {
     const char* saved = s;
-    WasmType type = tryGetType();
+    Type type = tryGetType();
     if (type != none && strchr(saved, '\n') > s) {
       s = saved;
       type = none;
@@ -409,8 +409,8 @@ class S2WasmBuilder {
     return type;
   }
 
-  WasmType getType() {
-    WasmType t = tryGetType();
+  Type getType() {
+    Type t = tryGetType();
     if (t != none) {
       return t;
     }
@@ -510,6 +510,7 @@ class S2WasmBuilder {
       else if (match("data")) {}
       else if (match("ident")) skipToEOL();
       else if (match("section")) parseToplevelSection();
+      else if (match("file")) parseFile();
       else if (match("align") || match("p2align")) skipToEOL();
       else if (match("import_global")) {
         skipToEOL();
@@ -597,26 +598,16 @@ class S2WasmBuilder {
   }
 
   void parseFile() {
+    if (debug) dump("file");
+    size_t fileId = 0;
     if (*s != '"') {
-      // TODO: optimize, see recordFile below
-      size_t fileId = getInt();
+      fileId = getInt();
       skipWhitespace();
-      auto quoted = getQuoted();
-      uint32_t index = wasm->debugInfoFileNames.size();
-      fileIndexMap[fileId] = index;
-      wasm->debugInfoFileNames.push_back(std::string(quoted.begin(), quoted.end()));
-      s = strchr(s, '\n');
-      return;
     }
-    // '.file' without first index argument points to bc-file
-    s++;
-    std::string filename;
-    while (*s != '"') {
-      filename += *s;
-      s++;
-    }
-    s++;
-    WASM_UNUSED(filename); // TODO: use the filename
+    auto filename = getQuoted();
+    uint32_t index = wasm->debugInfoFileNames.size();
+    wasm->debugInfoFileNames.push_back(std::string(filename.begin(), filename.end()));
+    fileIndexMap[fileId] = index;
   }
 
   void parseGlobl() {
@@ -670,16 +661,6 @@ class S2WasmBuilder {
 
     Function::DebugLocation debugLocation = { 0, 0, 0 };
     bool useDebugLocation = false;
-    auto recordFile = [&]() {
-      if (debug) dump("file");
-      size_t fileId = getInt();
-      skipWhitespace();
-      auto quoted = getQuoted();
-      uint32_t index = wasm->debugInfoFileNames.size();
-      fileIndexMap[fileId] = index;
-      wasm->debugInfoFileNames.push_back(std::string(quoted.begin(), quoted.end()));
-      s = strchr(s, '\n');
-    };
     auto recordLoc = [&]() {
       if (debug) dump("loc");
       size_t fileId = getInt();
@@ -709,16 +690,16 @@ class S2WasmBuilder {
     };
     wasm::Builder builder(*wasm);
     std::vector<NameType> params;
-    WasmType resultType = none;
+    Type resultType = none;
     std::vector<NameType> vars;
 
-    std::map<Name, WasmType> localTypes;
+    std::map<Name, Type> localTypes;
     // params and result
     while (1) {
       if (match(".param")) {
         while (1) {
           Name name = getNextId();
-          WasmType type = getType();
+          Type type = getType();
           params.emplace_back(name, type);
           localTypes[name] = type;
           skipWhitespace();
@@ -736,14 +717,14 @@ class S2WasmBuilder {
       } else if (match(".local")) {
         while (1) {
           Name name = getNextId();
-          WasmType type = getType();
+          Type type = getType();
           vars.emplace_back(name, type);
           localTypes[name] = type;
           skipWhitespace();
           if (!match(",")) break;
         }
       } else if (match(".file")) {
-        recordFile();
+        parseFile();
         skipWhitespace();
       } else if (match(".loc")) {
         recordLoc();
@@ -829,7 +810,7 @@ class S2WasmBuilder {
     auto setOutput = [&](Expression* curr, Name assign) {
       if (assign.isNull() || assign.str[0] == 'd') { // drop
         auto* add = curr;
-        if (isConcreteWasmType(curr->type)) {
+        if (isConcreteType(curr->type)) {
           add = builder.makeDrop(curr);
         }
         addToBlock(add);
@@ -862,7 +843,7 @@ class S2WasmBuilder {
       return attributes;
     };
     //
-    auto makeBinary = [&](BinaryOp op, WasmType type) {
+    auto makeBinary = [&](BinaryOp op, Type type) {
       Name assign = getAssign();
       skipComma();
       auto curr = allocator->alloc<Binary>();
@@ -874,7 +855,7 @@ class S2WasmBuilder {
       assert(curr->type == type);
       setOutput(curr, assign);
     };
-    auto makeUnary = [&](UnaryOp op, WasmType type) {
+    auto makeUnary = [&](UnaryOp op, Type type) {
       Name assign = getAssign();
       skipComma();
       auto curr = allocator->alloc<Unary>();
@@ -917,12 +898,13 @@ class S2WasmBuilder {
       add->right = reloc;
       return (Expression*)add;
     };
-    auto makeLoad = [&](WasmType type) {
+    auto makeLoad = [&](Type type) {
       skipComma();
       auto curr = allocator->alloc<Load>();
+      curr->isAtomic = false;
       curr->type = type;
       int32_t bytes = getInt() / CHAR_BIT;
-      curr->bytes = bytes > 0 ? bytes : getWasmTypeSize(type);
+      curr->bytes = bytes > 0 ? bytes : getTypeSize(type);
       curr->signed_ = match("_s");
       match("_u");
       Name assign = getAssign();
@@ -933,18 +915,19 @@ class S2WasmBuilder {
       curr->align = curr->bytes;
       if (attributes[0]) {
         assert(strncmp(attributes[0], "p2align=", 8) == 0);
-        curr->align = 1U << getInt(attributes[0] + 8);
+        curr->align = Address(1) << getInt(attributes[0] + 8);
       }
       setOutput(curr, assign);
     };
-    auto makeStore = [&](WasmType type) {
+    auto makeStore = [&](Type type) {
       auto curr = allocator->alloc<Store>();
+      curr->isAtomic = false;
       curr->valueType = type;
       s += strlen("store");
       if(!isspace(*s)) {
         curr->bytes = getInt() / CHAR_BIT;
       } else {
-        curr->bytes = getWasmTypeSize(type);
+        curr->bytes = getTypeSize(type);
       }
       skipWhitespace();
       auto relocation = getRelocatableExpression(&curr->offset.addr);
@@ -955,13 +938,13 @@ class S2WasmBuilder {
       curr->align = curr->bytes;
       if (attributes[0]) {
         assert(strncmp(attributes[0], "p2align=", 8) == 0);
-        curr->align = 1U << getInt(attributes[0] + 8);
+        curr->align = Address(1) << getInt(attributes[0] + 8);
       }
       curr->value = inputs[1];
       curr->finalize();
       addToBlock(curr);
     };
-    auto makeSelect = [&](WasmType type) {
+    auto makeSelect = [&](Type type) {
       Name assign = getAssign();
       skipComma();
       auto curr = allocator->alloc<Select>();
@@ -973,7 +956,7 @@ class S2WasmBuilder {
       curr->type = type;
       setOutput(curr, assign);
     };
-    auto makeCall = [&](WasmType type) {
+    auto makeCall = [&](Type type) {
       if (match("_indirect")) {
         // indirect call
         Name assign = getAssign();
@@ -1013,7 +996,7 @@ class S2WasmBuilder {
     #define BINARY_INT_OR_FLOAT(op) (type == i32 ? BinaryOp::op##Int32 : (type == i64 ? BinaryOp::op##Int64 : (type == f32 ? BinaryOp::op##Float32 : BinaryOp::op##Float64)))
     #define BINARY_INT(op) (type == i32 ? BinaryOp::op##Int32 : BinaryOp::op##Int64)
     #define BINARY_FLOAT(op) (type == f32 ? BinaryOp::op##Float32 : BinaryOp::op##Float64)
-    auto handleTyped = [&](WasmType type) {
+    auto handleTyped = [&](Type type) {
       switch (*s) {
         case 'a': {
           if (match("add")) makeBinary(BINARY_INT_OR_FLOAT(Add), type);
@@ -1188,7 +1171,7 @@ class S2WasmBuilder {
       } else if (match("f64.")) {
         handleTyped(f64);
       } else if (match("block")) {
-        WasmType blockType = tryGetTypeWithoutNewline();
+        Type blockType = tryGetTypeWithoutNewline();
         auto curr = allocator->alloc<Block>();
         curr->type = blockType;
         curr->name = getNextLabel();
@@ -1197,7 +1180,7 @@ class S2WasmBuilder {
       } else if (match("end_block")) {
         auto* block = bstack.back()->cast<Block>();
         block->finalize(block->type);
-        if (isConcreteWasmType(block->type) && block->list.size() == 0) {
+        if (isConcreteType(block->type) && block->list.size() == 0) {
           // empty blocks that return a value are not valid, fix that up
           block->list.push_back(allocator->alloc<Unreachable>());
           block->finalize();
@@ -1211,7 +1194,7 @@ class S2WasmBuilder {
           recordLabel();
         } else s = strchr(s, '\n');
       } else if (match("loop")) {
-        WasmType loopType = tryGetTypeWithoutNewline();
+        Type loopType = tryGetTypeWithoutNewline();
         auto curr = allocator->alloc<Loop>();
         addToBlock(curr);
         curr->type = loopType;
@@ -1291,7 +1274,7 @@ class S2WasmBuilder {
         s = strchr(s, '\n');
         break; // the function is done
       } else if (match(".file")) {
-        recordFile();
+        parseFile();
       } else if (match(".loc")) {
         recordLoc();
       } else if (peek(".L") && strchr(s, ':') < strchr(s, '\n')) {
@@ -1447,7 +1430,7 @@ class S2WasmBuilder {
     Address localAlign = 1;
     if (*s == ',') {
       skipComma();
-      localAlign = 1 << getInt();
+      localAlign = Address(1) << getInt();
     }
     linkerObj->addStatic(size, std::max(align, localAlign), name);
   }
@@ -1489,12 +1472,12 @@ class S2WasmBuilder {
   // 2. Converts invoke wrapper names.
   //    Refer to the comments in fixEmExceptionInvoke below.
   template<typename ListType>
-  Name fixEmEHSjLjNames(const Name &name, WasmType result,
+  Name fixEmEHSjLjNames(const Name &name, Type result,
                         const ListType &operands) {
     return fixEmEHSjLjNames(name, getSig(result, operands));
   }
 
-  Name fixEmEHSjLjNames(const Name &name, const std::string &sig) {
+  Name fixEmEHSjLjNames(const Name &name, const std::string& sig) {
     if (name == "emscripten_longjmp_jmpbuf")
       return "emscripten_longjmp";
     return fixEmExceptionInvoke(name, sig);
@@ -1528,7 +1511,7 @@ class S2WasmBuilder {
   // This function converts the names of invoke wrappers based on their lowered
   // argument types and a return type. In the example above, the resulting new
   // wrapper name becomes "invoke_vii".
-  Name fixEmExceptionInvoke(const Name &name, const std::string &sig) {
+  Name fixEmExceptionInvoke(const Name &name, const std::string& sig) {
     std::string nameStr = name.c_str();
     if (nameStr.front() == '"' && nameStr.back() == '"') {
       nameStr = nameStr.substr(1, nameStr.size() - 2);
