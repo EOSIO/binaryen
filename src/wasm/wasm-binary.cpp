@@ -1271,12 +1271,12 @@ void WasmBinaryBuilder::readSignatures() {
 }
 
 Name WasmBinaryBuilder::getFunctionIndexName(Index i) {
-  if (i < functionImportIndexes.size()) {
-    auto* import = wasm.getImport(functionImportIndexes[i]);
+  if (i < functionImports.size()) {
+    auto* import = functionImports[i];
     assert(import->kind == ExternalKind::Function);
     return import->name;
   } else {
-    i -= functionImportIndexes.size();
+    i -= functionImports.size();
     if (i >= wasm.functions.size()) {
       throw ParseException("bad function index");
     }
@@ -1311,7 +1311,8 @@ void WasmBinaryBuilder::readImports() {
         }
         curr->functionType = wasm.functionTypes[index]->name;
         assert(curr->functionType.is());
-        functionImportIndexes.push_back(curr->name);
+        functionImports.push_back(curr);
+        continue; // don't add the import yet, we add them later after we know their names
         break;
       }
       case ExternalKind::Table: {
@@ -1681,8 +1682,12 @@ Name WasmBinaryBuilder::getGlobalName(Index index) {
 }
 
 void WasmBinaryBuilder::processFunctions() {
-  for (auto& func : functions) {
+  for (auto* func : functions) {
     wasm.addFunction(func);
+  }
+
+  for (auto* import : functionImports) {
+    wasm.addImport(import);
   }
 
   // we should have seen all the functions
@@ -1718,6 +1723,14 @@ void WasmBinaryBuilder::processFunctions() {
     auto& calls = iter.second;
     for (auto* call : calls) {
       call->target = wasm.functions[index]->name;
+    }
+  }
+
+  for (auto& iter : functionImportCalls) {
+    size_t index = iter.first;
+    auto& calls = iter.second;
+    for (auto* call : calls) {
+      call->target = functionImports[index]->name;
     }
   }
 
@@ -1793,25 +1806,24 @@ void WasmBinaryBuilder::readNames(size_t payloadLen) {
       continue;
     }
     auto num = getU32LEB();
-    uint32_t importedFunctions = 0;
-    for (auto& import : wasm.imports) {
-      if (import->kind != ExternalKind::Function) continue;
-      importedFunctions++;
-    }
+    std::set<Name> usedNames;
     for (size_t i = 0; i < num; i++) {
       auto index = getU32LEB();
-      if (index < importedFunctions) {
-        getInlineString(); // TODO: use this
-      } else if (index - importedFunctions < functions.size()) {
-        auto name = getInlineString();
-        functions[index - importedFunctions]->name = name;
+      auto rawName = getInlineString();
+      auto name = rawName;
+      // De-duplicate names by appending .1, .2, etc.
+      for (int i = 1; !usedNames.insert(name).second; ++i) {
+        name = rawName.str + std::string(".") + std::to_string(i);
       }
-    }
-    // disallow duplicate names
-    std::set<Name> functionNames;
-    for (auto* func : functions) {
-      if (!functionNames.insert(func->name).second) {
-        throw ParseException("duplicate function name: " + std::string(func->name.str));
+      // note: we silently ignore errors here, as name section errors
+      //       are not fatal. should we warn?
+      auto numFunctionImports = functionImports.size();
+      if (index < numFunctionImports) {
+        functionImports[index]->name = name;
+      } else if (index - numFunctionImports < functions.size()) {
+        functions[index - numFunctionImports]->name = name;
+      } else {
+        throw ParseException("index out of bounds: " + std::string(name.str));
       }
     }
     if (pos != subsectionPos + subsectionSize) {
@@ -2022,19 +2034,20 @@ Expression* WasmBinaryBuilder::visitCall() {
   auto index = getU32LEB();
   FunctionType* type;
   Expression* ret;
-  if (index < functionImportIndexes.size()) {
+  if (index < functionImports.size()) {
     // this is a call of an imported function
     auto* call = allocator.alloc<CallImport>();
-    auto* import = wasm.getImport(functionImportIndexes[index]);
-    call->target = import->name;
+    auto* import = functionImports[index];
     type = wasm.getFunctionType(import->functionType);
+    functionImportCalls[index].push_back(call);
+    call->target = import->name; // name section may modify it
     fillCall(call, type);
     call->finalize();
     ret = call;
   } else {
     // this is a call of a defined function
     auto* call = allocator.alloc<Call>();
-    auto adjustedIndex = index - functionImportIndexes.size();
+    auto adjustedIndex = index - functionImports.size();
     if (adjustedIndex >= functionTypes.size()) {
       throw ParseException("bad call index");
     }
