@@ -93,6 +93,9 @@ void Linker::layout() {
     }
   }
 
+  // Place the stack first, so any overrun is a page fault instead of corruption
+  if (stackAllocation) allocateStatic(stackAllocation, 16, ".stack");
+
   // Allocate all user statics
   for (const auto& obj : out.staticObjects) {
     allocateStatic(obj.allocSize, obj.alignment, obj.name);
@@ -104,10 +107,6 @@ void Linker::layout() {
     out.wasm.memory.segments[seg.second].offset = out.wasm.allocator.alloc<Const>()->set(Literal(uint32_t(address)));
     segmentsByAddress[address] = seg.second;
   }
-
-  // Place the stack after the user's static data, to keep those addresses
-  // small.
-  if (stackAllocation) allocateStatic(stackAllocation, 16, ".stack");
 
   // The minimum initial memory size is the amount of static variables we have
   // allocated. Round it up to a page, and update the page-increment versions
